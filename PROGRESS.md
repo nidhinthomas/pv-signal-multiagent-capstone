@@ -4,18 +4,39 @@
 |---|---|---|---|
 | 0 - Scaffolding, Docs, Design Spec, Smoke Test & Repo Setup | Done | 2026-09-26 | Repo created + pushed: github.com/nidhinthomas/pv-signal-multiagent-capstone |
 | 1 - Synthetic Data | Done | 2026-09-26 | 10,681 AE reports; 2 strong + 1 borderline + 1 trap-case signal, verified via independent SQL |
-| 2 - MCP Server & Client | Not started | | |
-| 3 - Agent Specs, Model Wiring & Shared State | Not started | | |
+| 2 - MCP Server & Client | Done | 2026-09-26 | 7 tools built (parallel agent); self-test (33 checks) + live integration check against real Phase 1 data both pass |
+| 3 - Agent Specs, Model Wiring & Shared State | Done | 2026-09-26 | 3 subagent specs (parallel agent) + loader.py/state.py (sequential); loader unit test passed |
 | 4 - LangGraph Pipeline (CLI-only) | Not started | | |
 | 5 - Runtime Hooks (Guardrails + Observability) | Not started | | |
 | 6 - Streamlit UI | Not started | | |
-| 7 - Dev/Ops Claude Code Layer | Not started | | |
+| 7 - Dev/Ops Claude Code Layer | Done | 2026-09-26 | 2 skills + settings.json + 2 hooks (parallel agent); self-tests + live hook fire/block both confirmed |
 | 8 - Evaluation | Not started | | |
 | 9 - Documentation & Governance | Not started | | |
 
 ## Log
 
 (reverse-chronological — newest entries at the top)
+
+### 2026-09-26 — Phase 7 complete (built by parallel background agent), plus incident note
+- `.claude/skills/pv-generate-data/SKILL.md`, `.claude/skills/pv-evaluate/SKILL.md`: run the data generator / evaluator via the venv interpreter, verify expected outputs exist, and report the specific numbers/checks (signal-strength breakdown, trap-case check, report-quality checks, cross-run memory check) rather than fabricating a summary.
+- `.claude/settings.json` wires `PreToolUse` (all tools) → `.claude/hooks/log_tool_use.py` (dev/ops tool-use logging to `logs/cc_dev_tool_use.jsonl`, fails open on any error) and `PostToolUse` (Write|Edit) → `.claude/hooks/validate_report.py` (blocks — exit 2 — a `reports/*.md` write/edit missing the synthetic banner, a review-status/approval marker, or containing unhedged causal language).
+- **Incident**: the agent's first attempt wrote `settings.json` before its referenced hook script existed, which — since Claude Code re-evaluates `PreToolUse` hooks live against every tool call in the project, fail-closed on a hook error — froze every tool call in both that agent's and this session's own tool use (nothing in-session could fix a hook blocking the very tools needed to fix it). Resolved only by the user deleting `.claude/settings.json` from outside the blocked session. On retry, the agent verified each hook script with `py_compile` + direct stdin execution *before* wiring `settings.json`, avoiding a repeat.
+- Exit check passed: hook self-tests (fail-open on malformed input; correct pass/fail detection) plus a live end-to-end check — a real tool call confirmed `PreToolUse` logging fires, and a real `Write` of a deliberately deficient report file correctly triggered a live blocking `PostToolUse` error with the exact missing items named.
+- Committed and pushed.
+
+### 2026-09-26 — Phase 2 complete (built by parallel background agent)
+- `mcp_server/server.py`: all 7 tools from `ARCHITECTURE.md` §6.1 (`query_ae_reports`, `scan_signals`, `calculate_prr`, `get_drug_label`, `search_literature`, `get_signal_history`, `record_signal_decision`), exact signatures/schemas. PRR computed deterministically server-side via one grouped SQL query, not per-pair. `record_signal_decision` has no caller restriction at this layer — that gating is Phase 5's job.
+- `mcp_client/client.py`: async stdio wrapper (`MCPClient` + module-level plain-async functions per tool), spawning `server.py` as a real subprocess — never imported directly.
+- `mcp_server/_test_tools.py`: a self-contained unit test (throwaway sqlite + literature fixtures, hand-derived PRR expectations) exercised only through the client wrapper. Kept (not deleted) as a real regression test, not treated as throwaway scratch work.
+- Exit check passed twice: (1) `_test_tools.py`, 33/33 checks pass against the fixture; (2) live integration check against Phase 1's real `data/db.sqlite` — `scan_signals` correctly recovers both strong pairs, the borderline pair, and the trap case (matching Phase 1's independently-verified PRR values exactly) while correctly excluding all 4 noise pairs.
+- Committed and pushed.
+
+### 2026-09-26 — Phase 3 complete
+- Agent-spec files (`.claude/agents/signal-detector.md`, `literature-reviewer.md`, `safety-report-writer.md`) built by a parallel background agent: least-privilege tool allowlists exactly per `ARCHITECTURE.md` §5.1, delimited `### Reasoning`/`### Conclusion` output structure in all three, honest "no history"/"no literature found" instructions (no fabrication), and safety-report-writer's hard guardrail against overclaiming novelty for label-known events.
+- `agents/loader.py` (sequential, built directly): parses `.claude/agents/*.md` frontmatter (`name`, `description`, `tools` — handles both YAML-list and comma-separated string forms) + system-prompt body into an `AgentSpec`. `agents/state.py`: `PipelineState` TypedDict (candidates, current literature/report, `trace: list[StepRecord]`, finalized decisions) + JSON snapshot to `runs/<run_id>/state.json`.
+- Exit check passed: unit test confirms all three spec files parse with the exact expected tool allowlists and that the delimited reasoning/conclusion markers are present; `state.py` save/load round-trips correctly.
+- `pyyaml` (already installed) added to `requirements.txt`, since `loader.py` needs it.
+- Committed across 2 commits (subagent specs, then loader/state) and pushed.
 
 ### 2026-09-26 — Phase 1 complete (built by parallel background agent)
 - `data/generate_synthetic_data.py`: 10 fictional drugs x 18 fictional/generic AE terms, seed=42, closed-form solve for exact target PRR per engineered pair (not pure random simulation) so every target lands in its acceptance band deterministically.

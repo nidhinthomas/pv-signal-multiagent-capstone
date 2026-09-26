@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/labuser/venv/bin/python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/log_tool_use.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/labuser/venv/bin/python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/validate_report.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
