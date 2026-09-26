@@ -196,6 +196,79 @@ Runtime hook layer (Python wrappers around LangGraph nodes/tool calls — distin
 | Persistence | sqlite (checkpointer + long-term memory) | Already available, zero extra infra, sufficient for demo scale |
 | Dev/ops layer | Claude Code `.claude/agents`, `.claude/skills`, `.claude/hooks`, `CLAUDE.md` | Rubric-mandated Claude Code primitives, kept real by giving them either a runtime-configuring role (agent specs) or a genuine dev/ops role (data-gen/eval skills, validation hooks) |
 
+## 6.1 Data schemas & MCP tool signatures (interface contract, fixed before parallel dispatch)
+
+Phases 1 (data), 2 (MCP server), and 3's agent specs are built in parallel by separate agents. This section is the single source of truth they all build against, so their outputs compose without renegotiation.
+
+### `data/db.sqlite`
+
+```sql
+CREATE TABLE drugs (
+    drug_id INTEGER PRIMARY KEY,
+    drug_name TEXT NOT NULL UNIQUE,       -- fictional, e.g. "Neuroclarin"
+    label_events TEXT NOT NULL            -- JSON array of event names already on this drug's synthetic label
+);
+
+CREATE TABLE ae_reports (
+    report_id INTEGER PRIMARY KEY,
+    drug_id INTEGER NOT NULL REFERENCES drugs(drug_id),
+    event_name TEXT NOT NULL,             -- fictional or generic AE term, e.g. "Vertigo"
+    patient_age INTEGER,
+    patient_sex TEXT,                     -- 'M' | 'F'
+    report_date TEXT NOT NULL             -- ISO date
+);
+```
+
+One suspect drug and one event term per report row (a drug-event co-occurrence is one row; a real-world multi-event report is represented as multiple rows sharing a `report_id`... but for this demo, `report_id` is just a row's own primary key — reports are not deduplicated across events, which keeps the 2x2 PRR contingency table computation simple: for pair (X, Y), `a` = count of rows with `drug_id=X AND event_name=Y`, `b` = count with `drug_id=X AND event_name!=Y`, `c` = count with `drug_id!=X AND event_name=Y`, `d` = count with `drug_id!=X AND event_name!=Y`).
+
+### `data/ground_truth_signals.json`
+
+```json
+{
+  "signals": [
+    {"drug_name": "...", "event_name": "...", "strength": "strong|borderline|noise", "is_trap_case": false}
+  ]
+}
+```
+
+### `data/literature_corpus.json`
+
+```json
+{
+  "publications": [
+    {"id": "pub-001", "title": "...", "drug_name": "...", "event_name": "...", "stance": "corroborates|contradicts|irrelevant", "text": "..."}
+  ]
+}
+```
+
+### `memory/signal_history.sqlite` (created and owned by `mcp_server/server.py`)
+
+```sql
+CREATE TABLE signal_history (
+    drug_name TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    decision TEXT NOT NULL,               -- 'approved' | 'rejected' | 'sent_back'
+    reviewer_note TEXT,
+    prr_at_decision REAL,
+    case_count_at_decision INTEGER,
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (drug_name, event_name, run_id)
+);
+```
+
+### MCP tool signatures
+
+| Tool | Signature | Returns |
+|---|---|---|
+| `query_ae_reports` | `(drug_name: str \| None = None, event_name: str \| None = None, limit: int = 100)` | `list[{report_id, drug_name, event_name, patient_age, patient_sex, report_date}]` |
+| `scan_signals` | `(prr_threshold: float = 2.0, min_cases: int = 3)` | `list[{drug_name, event_name, case_count, prr, background_rate}]`, sorted by `prr` desc, only pairs meeting both thresholds |
+| `calculate_prr` | `(drug_name: str, event_name: str)` | `{drug_name, event_name, case_count, prr, a, b, c, d}` |
+| `get_drug_label` | `(drug_name: str)` | `{drug_name, label_events: list[str]}` |
+| `search_literature` | `(query: str)` | `list[{id, title, drug_name, event_name, stance, text}]` (keyword match over title/text/drug_name/event_name) |
+| `get_signal_history` | `(drug_name: str, event_name: str)` | `{drug_name, event_name, first_seen_run_id: str \| None, history: list[{run_id, decision, reviewer_note, prr_at_decision, case_count_at_decision, timestamp}]}` |
+| `record_signal_decision` | `(drug_name: str, event_name: str, run_id: str, decision: str, reviewer_note: str, prr_at_decision: float, case_count_at_decision: int)` | `{success: true}` |
+
 ## 7. UI design spec (fixed here in Phase 0 — Phase 6 is implementation-only against this spec)
 
 Deciding this once upfront avoids exploratory redesign during the UI build phase.
