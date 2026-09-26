@@ -3,7 +3,7 @@
 | Phase | Status | Date | Notes |
 |---|---|---|---|
 | 0 - Scaffolding, Docs, Design Spec, Smoke Test & Repo Setup | Done | 2026-09-26 | Repo created + pushed: github.com/nidhinthomas/pv-signal-multiagent-capstone |
-| 1 - Synthetic Data | Not started | | |
+| 1 - Synthetic Data | Done | 2026-09-26 | 10,681 AE reports; 2 strong + 1 borderline + 1 trap-case signal, verified via independent SQL |
 | 2 - MCP Server & Client | Not started | | |
 | 3 - Agent Specs, Model Wiring & Shared State | Not started | | |
 | 4 - LangGraph Pipeline (CLI-only) | Not started | | |
@@ -16,6 +16,14 @@
 ## Log
 
 (reverse-chronological — newest entries at the top)
+
+### 2026-09-26 — Phase 1 complete (built by parallel background agent)
+- `data/generate_synthetic_data.py`: 10 fictional drugs x 18 fictional/generic AE terms, seed=42, closed-form solve for exact target PRR per engineered pair (not pure random simulation) so every target lands in its acceptance band deterministically.
+- Generated `data/db.sqlite` (10,681 `ae_reports` rows, 10 `drugs`), `data/ground_truth_signals.json`, `data/literature_corpus.json` (26 publications: 7 corroborates, 2 contradicts, 17 irrelevant) — all gitignored per plan, only the generator script is committed.
+- Engineered signals: 2 strong pairs (Neuroclarin/Hepatic Enzyme Elevation PRR 6.22, Vastocor/Tendon Rupture PRR 5.09), 1 borderline pair (Ferinox/Photosensitivity Rash PRR 2.14), 1 trap case (Cardiozan/QT Interval Prolongation PRR 4.51, already on Cardiozan's synthetic label).
+- Exit check passed: independent SQL recomputation (not the generator's own printout) of every ground-truth pair's PRR/case_count, plus a full drug x event scan confirming zero unintended pairs cross `PRR_THRESHOLD=2.0` at `MIN_CASE_COUNT=3`.
+- No deviations from `ARCHITECTURE.md` §6.1's schema.
+- Committed (`f9799f8`) and pushed.
 
 ### 2026-09-26 — Phase 0 complete
 - Plan approved by user; `PLAN.md` (persisted copy of the approved plan) and `ASSIGNMENT.md` (verbatim brief, pulled from the pre-compaction transcript) written.
