@@ -6,7 +6,7 @@
 | 1 - Synthetic Data | Done | 2026-09-26 | 10,681 AE reports; 2 strong + 1 borderline + 1 trap-case signal, verified via independent SQL |
 | 2 - MCP Server & Client | Done | 2026-09-26 | 7 tools built (parallel agent); self-test (33 checks) + live integration check against real Phase 1 data both pass |
 | 3 - Agent Specs, Model Wiring & Shared State | Done | 2026-09-26 | 3 subagent specs (parallel agent) + loader.py/state.py (sequential); loader unit test passed |
-| 4 - LangGraph Pipeline (CLI-only) | Not started | | |
+| 4 - LangGraph Pipeline (CLI-only) | Done | 2026-09-26 | Full 4-candidate run via CLI harness: interrupt/resume across real process restarts, trap case correctly flagged as label-known/non-novel, sequential processing confirmed |
 | 5 - Runtime Hooks (Guardrails + Observability) | Not started | | |
 | 6 - Streamlit UI | Not started | | |
 | 7 - Dev/Ops Claude Code Layer | Done | 2026-09-26 | 2 skills + settings.json + 2 hooks (parallel agent); self-tests + live hook fire/block both confirmed |
@@ -16,6 +16,27 @@
 ## Log
 
 (reverse-chronological — newest entries at the top)
+
+### 2026-09-26 — Phase 4 complete, plus an async-shutdown incident note
+
+- `agents/graph.py`: the full `StateGraph` — `signal_detector` (calls `scan_signals` once, then `get_signal_history` per candidate) routes into a strictly sequential per-candidate loop (`literature_reviewer` -> `safety_report_writer` -> `human_approval` [`interrupt()`] -> `finalize`) -> back to the next candidate or `END`, per CLAUDE.md rule #6 (never fanned out in parallel). Every LLM-facing node runs its own bounded (`MAX_TOOL_ITERATIONS=10`) tool-calling loop against `langchain_openai.ChatOpenAI` bound to that node's least-privilege tool set from `agents/tools.py`.
+- **Design principle enforced structurally, not just by prompt**: every machine-consumed field (candidate stats, history status, `label_known`, corroborating/contradicting publication lists) is derived directly from the real tool-call results captured during each node's turn — never parsed from the LLM's restated prose. Only signal-detector's prioritization *order* comes from its Conclusion text (first-mention position of each drug name).
+- `record_signal_decision` has exactly one call site in the whole codebase: `finalize_node`, gated by an `assert state["pending_decision"] is not None` that can only be true after `human_approval_node`'s `interrupt()` has actually returned a resumed human decision (CLAUDE.md rules #4/#5). `finalize_node` also writes the reviewer-ready report to `reports/<run_id>-<n>-safety-report.md` (via a `_write_report_file` helper), appending a `## Review Status` section and guaranteeing the synthetic-data banner is present even if the model's draft omitted it — a structural guarantee for CLAUDE.md rule #1, not just a prompt instruction.
+- `agents/cli_test_run.py`: the Phase 4 CLI test harness. Each invocation is a genuinely separate process (fresh `AsyncSqliteSaver` connection, fresh `MCPClient` subprocess) so running it twice against the same `--run-id` is a real simulated process restart between pause and resume, not an in-process mock of one.
+- **Exit check passed** via a real end-to-end run (`--run-id phase4test2`) driven through 5 separate CLI process invocations: all 4 real Phase 1 candidates processed strictly sequentially; every interrupt paused with a complete, correct payload and resumed correctly after a real process restart; all 3 human decisions exercised (`approved` for Neuroclarin, `rejected` for Vastocor and for the Cardiozan trap case, `sent_back` for the Ferinox borderline pair); the trap case's report explicitly states "this is a known, label-listed event, not a novel signal" (`label_known=True` from `get_drug_label`, corroborated by pub-009) and even flags for human reconciliation the apparent tension with the upstream "new signal, no prior history" history-status tag, rather than silently resolving it — confirming the anti-overclaiming guardrail is real. All 4 report files and all 4 `memory/signal_history.sqlite` rows verified correct (drug/event/decision/PRR/case_count) by direct inspection, not by trusting the run's own printed summary.
+- Deleted `_smoke_test_spike.py` per its own docstring instruction, now that Phase 4 has its own real CLI test.
+- **Incident**: the first real run hung for 10+ minutes post-completion inside `asyncio.run()`'s interpreter-shutdown cleanup (confirmed via `py-spy dump` that `main()` had already returned successfully; not root-caused further since it only occurs after all real work is done, and direct inspection of `mcp/client/stdio.py` ruled out the MCP transport's own shutdown logic, which is deliberately hard-timeout-bounded). Compounded by stdout being fully block-buffered under output redirection, so the first kill (`SIGKILL`, before this was understood) lost all real output. Fixed by adding an explicit `sys.stdout.flush()` before the `async with` block exits, running with `python3 -u`, and wrapping every invocation in `timeout --signal=TERM --kill-after=15 480` so a recurrence is safely terminated (with output already on disk) instead of requiring another manual kill. All subsequent runs' real output was captured correctly; this remains a cosmetic wall-clock cost on process exit, not a pipeline-correctness bug.
+- Committed and pushed.
+
+### 2026-09-26 — Rubric check against ASSIGNMENT.md (post-Phase-4, per PLAN.md's periodic-check schedule)
+
+Sanity-checked the 4 components PLAN.md calls out as most likely to get quietly lost when wiring LangGraph — all confirmed genuinely present, not just planned:
+- **Sub-agents**: 3 distinct specs (signal-detector, literature-reviewer, safety-report-writer) actually drive 3 distinct graph nodes with distinct system prompts and least-privilege tool allowlists, coordinating sequentially through shared state — not one LLM doing everything.
+- **MCP**: `agents/graph.py`/`agents/tools.py` only ever call the real `mcp_server/server.py` through `mcp_client/client.py`'s stdio subprocess wrapper; never imported directly.
+- **State/Context/Memory**: short-term `PipelineState` (checkpointed via `AsyncSqliteSaver`, keyed by `thread_id=run_id`) confirmed to survive a real process restart across 5 separate CLI invocations; long-term `memory/signal_history.sqlite` confirmed to hold all 4 correct decision rows, written only from `finalize_node`.
+- **Human-in-the-Loop**: `interrupt()`/`Command(resume=...)` exercised for real across all 3 decision types (`approved`/`rejected`/`sent_back`); `record_signal_decision` never fires without a resumed human decision already in state.
+
+Full line-by-line mapping against every mandatory component is deferred to the Phase 9 pass, per PLAN.md.
 
 ### 2026-09-26 — Phase 7 complete (built by parallel background agent), plus incident note
 - `.claude/skills/pv-generate-data/SKILL.md`, `.claude/skills/pv-evaluate/SKILL.md`: run the data generator / evaluator via the venv interpreter, verify expected outputs exist, and report the specific numbers/checks (signal-strength breakdown, trap-case check, report-quality checks, cross-run memory check) rather than fabricating a summary.
