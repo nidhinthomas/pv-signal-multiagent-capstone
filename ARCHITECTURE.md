@@ -313,3 +313,16 @@ A single accessible palette, used consistently everywhere (badges, timeline card
 ## 9. Divergence log
 
 *(Updated whenever a later phase's real implementation differs from what's written above. Empty at Phase 0.)*
+
+### Phase 5 — §5.4's "block filesystem reads outside `data/db.sqlite`" guardrail is structural, not a dynamic `agents/hooks.py` check
+
+§5.4 as originally written implies a runtime hook that inspects a file path on every read and blocks anything outside `data/db.sqlite`. Building it turned up two reasons that's the wrong shape for this codebase:
+
+1. **There is no dynamic path input to check.** Direct re-inspection of `mcp_server/server.py` confirms all 7 tools hardcode their file/db access to module-level `DB_PATH` / `LITERATURE_CORPUS_PATH` / `SIGNAL_HISTORY_DB_PATH` constants — no tool signature accepts a caller-supplied path at all. A hook that "blocks reads outside an allowed path" has nothing to intercept, since no code path ever constructs a path from untrusted input.
+2. **A naive static check would break the existing Phase 2 test suite.** `mcp_server/_test_tools.py` legitimately overrides those same module-level constants via `PV_MCP_DB_PATH` / `PV_MCP_LITERATURE_CORPUS_PATH` env vars to point at throwaway fixture files outside `config.ALLOWED_DATA_PATHS`. A hook that compared the module-level vars against `config.ALLOWED_DATA_PATHS` would fail that suite's legitimate fixture runs, not just real violations.
+
+**Resolution**: this guardrail is enforced structurally, by tool-signature design (no caller-supplied path ever exists to misuse), rather than as a dynamic check in `agents/hooks.py`. Documented in `agents/hooks.py`'s module docstring; the other two §5.4 pre-call guardrails (`record_signal_decision` caller/decision check, report-content check) and all of post-call observability are implemented exactly as specified, dynamically, in `agents/hooks.py` and wired into every node in `agents/graph.py`.
+
+### Phase 5 — live false positive in the causal-language guardrail, fixed
+
+The first real end-to-end run (`phase5test1`) hit a genuine `GuardrailViolation` on a *legitimate* report: safety-report-writer wrote "...does not constitute a determination that Vastocor causes or is responsible for tendon rupture" — exactly the cautious hedging the anti-overclaiming guardrail exists to encourage — but the original `guard_report_content` did a bare substring match on `"causes"`, so it blocked its own intended behavior. Fixed by making the bad-phrase check negation-aware (`agents/hooks.py`'s `_is_hedged`: checks a preceding window for negation markers like "not", "does not constitute", "cannot" before flagging a hit). Regression case added to `agents/_test_hooks.py` reproducing this exact sentence.

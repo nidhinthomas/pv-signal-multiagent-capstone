@@ -26,12 +26,14 @@ import datetime
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
+from agents import hooks
 from agents import tools as pv_tools
 from agents.loader import AgentSpec, load_all_agents
 from agents.state import Candidate, LiteratureFindings, PipelineState, StepRecord, save_state
@@ -75,6 +77,7 @@ async def _run_agent_turn(
     spec: AgentSpec,
     user_content: str,
     trace: list[StepRecord],
+    run_id: str,
 ) -> tuple[str, list[dict]]:
     """Runs one subagent's full tool-calling turn through to a final answer.
 
@@ -83,6 +86,9 @@ async def _run_agent_turn(
     place). Returns (final_raw_text, tool_call_log), where tool_call_log is
     [{tool_name, args, result}, ...] in call order -- the caller derives all
     machine-consumed fields from this log, never from parsing final_raw_text.
+
+    Every LLM turn and every tool call is also logged to
+    logs/observability.jsonl via agents/hooks.py (ARCHITECTURE.md §5.4).
     """
     tool_objs = pv_tools.tools_for(spec.tools) if spec.tools else []
     llm = _make_llm(tool_objs)
@@ -90,11 +96,18 @@ async def _run_agent_turn(
     tool_call_log: list[dict] = []
 
     for _ in range(MAX_TOOL_ITERATIONS):
+        llm_start = time.monotonic()
         full: Optional[AIMessage] = None
         async for chunk in llm.astream(messages):
             full = chunk if full is None else full + chunk
         if full is None:
             raise RuntimeError(f"{agent_name}: LLM produced no output")
+        hooks.log_llm_turn(
+            run_id,
+            agent_name,
+            (time.monotonic() - llm_start) * 1000,
+            getattr(full, "usage_metadata", None),
+        )
 
         if full.tool_calls:
             messages.append(full)
@@ -108,7 +121,20 @@ async def _run_agent_turn(
                     )
                 )
                 tool = pv_tools.ALL_TOOLS[tc["name"]]
-                result = await tool.ainvoke(tc["args"])
+                tool_start = time.monotonic()
+                try:
+                    result = await tool.ainvoke(tc["args"])
+                except Exception as exc:
+                    hooks.log_tool_call(
+                        run_id, agent_name, tc["name"], tc["args"],
+                        (time.monotonic() - tool_start) * 1000, success=False, error=str(exc),
+                    )
+                    raise
+                hooks.log_tool_call(
+                    run_id, agent_name, tc["name"], tc["args"],
+                    (time.monotonic() - tool_start) * 1000, success=True,
+                    result_summary=hooks.summarize_result(result),
+                )
                 tool_call_log.append({"tool_name": tc["name"], "args": tc["args"], "result": result})
                 trace.append(
                     StepRecord(
@@ -152,7 +178,8 @@ async def signal_detector_node(state: PipelineState, mcp: MCPClient) -> dict:
         "default thresholds, then call get_signal_history for every candidate pair it returns, then "
         "produce your prioritized list per your instructions."
     )
-    text, tool_log = await _run_agent_turn("signal-detector", spec, user_content, state["trace"])
+    with hooks.timed_node(state["run_id"], "signal-detector"):
+        text, tool_log = await _run_agent_turn("signal-detector", spec, user_content, state["trace"], state["run_id"])
 
     scan_result = next((e["result"] for e in tool_log if e["tool_name"] == "scan_signals"), [])
     history_by_pair = {
@@ -192,7 +219,10 @@ async def literature_reviewer_node(state: PipelineState, mcp: MCPClient) -> dict
         f"signal-detector: case_count={candidate['case_count']}, prr={candidate['prr']:.2f}, "
         f"background_rate={candidate['background_rate']:.4f}, history_status={candidate['history_status']!r}."
     )
-    text, tool_log = await _run_agent_turn("literature-reviewer", spec, user_content, state["trace"])
+    with hooks.timed_node(state["run_id"], "literature-reviewer"):
+        text, tool_log = await _run_agent_turn(
+            "literature-reviewer", spec, user_content, state["trace"], state["run_id"]
+        )
 
     label_result = next((e["result"] for e in reversed(tool_log) if e["tool_name"] == "get_drug_label"), None)
     label_known = bool(label_result and candidate["event_name"] in (label_result.get("label_events") or []))
@@ -246,7 +276,10 @@ async def safety_report_writer_node(state: PipelineState, mcp: MCPClient) -> dic
         f"Synthetic-data banner text to include verbatim: {config.SYNTHETIC_DATA_BANNER!r}\n\n"
         "Draft the report now, per your instructions."
     )
-    text, _tool_log = await _run_agent_turn("safety-report-writer", spec, user_content, state["trace"])
+    with hooks.timed_node(state["run_id"], "safety-report-writer"):
+        text, _tool_log = await _run_agent_turn(
+            "safety-report-writer", spec, user_content, state["trace"], state["run_id"]
+        )
     _, conclusion = _split_reasoning_conclusion(text)
     return {"current_report": conclusion}
 
@@ -286,6 +319,11 @@ def _write_report_file(state: PipelineState, candidate: Candidate, decision: str
         f"- **Decision:** {decision}\n"
         f"- **Reviewer note:** {reviewer_note or '(none)'}\n"
     )
+    try:
+        hooks.guard_report_content(body)
+    except hooks.GuardrailViolation as exc:
+        hooks.log_guardrail_block(state["run_id"], "finalize", exc)
+        raise
     config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = config.REPORTS_DIR / f"{state['run_id']}-{state['current_candidate_index']}-safety-report.md"
     path.write_text(body, encoding="utf-8")
@@ -295,24 +333,37 @@ def _write_report_file(state: PipelineState, candidate: Candidate, decision: str
 async def finalize_node(state: PipelineState, mcp: MCPClient) -> dict:
     """The ONLY call site for record_signal_decision in the entire system
     (CLAUDE.md rule #4), and only reachable after human_approval_node's
-    interrupt() has actually returned a resumed human decision."""
-    candidate = state["candidates"][state["current_candidate_index"]]
-    assert state["pending_decision"] is not None, "finalize_node requires a recorded human decision"
-    decision_payload = json.loads(state["pending_decision"])
-    decision = decision_payload["decision"]
-    reviewer_note = decision_payload.get("reviewer_note", "")
+    interrupt() has actually returned a resumed human decision.
 
-    _write_report_file(state, candidate, decision, reviewer_note)
+    `hooks.guard_record_signal_decision` is the second, independent
+    enforcement point rule #4 requires (the first is Phase 3's tool
+    allowlisting): it inspects the real call stack rather than trusting
+    this function's own assert, so a future bug or refactor here can't
+    silently defeat it.
+    """
+    with hooks.timed_node(state["run_id"], "finalize"):
+        candidate = state["candidates"][state["current_candidate_index"]]
+        assert state["pending_decision"] is not None, "finalize_node requires a recorded human decision"
+        decision_payload = json.loads(state["pending_decision"])
+        decision = decision_payload["decision"]
+        reviewer_note = decision_payload.get("reviewer_note", "")
 
-    result = await mcp.record_signal_decision(
-        drug_name=candidate["drug_name"],
-        event_name=candidate["event_name"],
-        run_id=state["run_id"],
-        decision=decision,
-        reviewer_note=reviewer_note,
-        prr_at_decision=candidate["prr"],
-        case_count_at_decision=candidate["case_count"],
-    )
+        _write_report_file(state, candidate, decision, reviewer_note)
+
+        try:
+            hooks.guard_record_signal_decision(state)
+        except hooks.GuardrailViolation as exc:
+            hooks.log_guardrail_block(state["run_id"], "finalize", exc)
+            raise
+        result = await mcp.record_signal_decision(
+            drug_name=candidate["drug_name"],
+            event_name=candidate["event_name"],
+            run_id=state["run_id"],
+            decision=decision,
+            reviewer_note=reviewer_note,
+            prr_at_decision=candidate["prr"],
+            case_count_at_decision=candidate["case_count"],
+        )
     trace = state["trace"] + [
         StepRecord(
             agent="finalize",

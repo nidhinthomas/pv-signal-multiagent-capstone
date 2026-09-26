@@ -7,7 +7,7 @@
 | 2 - MCP Server & Client | Done | 2026-09-26 | 7 tools built (parallel agent); self-test (33 checks) + live integration check against real Phase 1 data both pass |
 | 3 - Agent Specs, Model Wiring & Shared State | Done | 2026-09-26 | 3 subagent specs (parallel agent) + loader.py/state.py (sequential); loader unit test passed |
 | 4 - LangGraph Pipeline (CLI-only) | Done | 2026-09-26 | Full 4-candidate run via CLI harness: interrupt/resume across real process restarts, trap case correctly flagged as label-known/non-novel, sequential processing confirmed |
-| 5 - Runtime Hooks (Guardrails + Observability) | Not started | | |
+| 5 - Runtime Hooks (Guardrails + Observability) | Done | 2026-09-26 | Both required guardrails verified live (real block + fix, not just unit tests); full 4-candidate run produced a clean observability trail |
 | 6 - Streamlit UI | Not started | | |
 | 7 - Dev/Ops Claude Code Layer | Done | 2026-09-26 | 2 skills + settings.json + 2 hooks (parallel agent); self-tests + live hook fire/block both confirmed |
 | 8 - Evaluation | Not started | | |
@@ -16,6 +16,16 @@
 ## Log
 
 (reverse-chronological — newest entries at the top)
+
+### 2026-09-26 — Phase 5 complete, plus a live guardrail false-positive incident
+
+- `agents/hooks.py`: two independently-enforced pre-call guardrails plus post-call observability, wired into every node in `agents/graph.py`. `guard_record_signal_decision` is the second, genuinely independent enforcement point CLAUDE.md rule #4 requires — it inspects the real Python call stack (`inspect.stack()[1].function == "finalize_node"`) rather than trusting a self-reported flag, so a future bug or edit to `finalize_node` can't silently bypass it. `guard_report_content` blocks a report write missing the synthetic banner, missing a review-status/approval marker, or containing unhedged causal language.
+- `log_event`/`timed_node`/`log_llm_turn`/`log_tool_call` append one JSON line per node execution, LLM turn, tool call, and guardrail block to `logs/observability.jsonl` (agent, tool, args, latency, timestamp, real OpenRouter token usage where available) — fails open (never raises) so a logging bug can't take down the pipeline.
+- §5.4's third guardrail ("block filesystem reads outside `data/db.sqlite`") turned out to have no dynamic check to write — no MCP tool accepts a caller-supplied path at all (re-confirmed directly in `mcp_server/server.py`), so it's enforced structurally by tool-signature design instead. Logged as a divergence in `ARCHITECTURE.md` §9, per CLAUDE.md's coding standards.
+- `agents/_test_hooks.py`: permanent regression test (kept, not thrown away), 11/11 checks — both guardrail violations, both happy paths, and observability-logging correctness.
+- **Incident (caught live, not just in the unit test)**: the real end-to-end run (`phase5test1`) hit a genuine `GuardrailViolation` on a *legitimate* report — safety-report-writer wrote "...does not constitute a determination that Vastocor causes or is responsible for tendon rupture," and the original `guard_report_content` did a bare substring match on `"causes"`, blocking its own intended hedging behavior. Fixed by making the check negation-aware (`_is_hedged`: scans a preceding window for negation markers before flagging a hit); regression case reproducing this exact sentence added to `agents/_test_hooks.py` (now 11/11). Logged as a second divergence-log entry in `ARCHITECTURE.md` §9.
+- **Exit check passed** via a real end-to-end run (`phase5test1`, 5 CLI invocations, one deliberately hitting the bug above and then re-verified clean after the fix): all 4 candidates (Neuroclarin, Vastocor, Ferinox, Cardiozan) finalized and approved; `logs/observability.jsonl` shows a complete trail (`node_start`/`node_end`: 14/13 — the 1-count gap is the caught `node_error` from the incident above — `llm_turn`: 17, `tool_call`: 15, real token usage totaling ~59,735 tokens) with exactly one `guardrail_block` entry, matching the one real incident and zero spurious blocks afterward; all 4 report files and all 4 `memory/signal_history.sqlite` rows verified correct by direct inspection. The trap case (Cardiozan) report still correctly reads "known, label-listed event, not a novel signal" and additionally picked up "previously reviewed and rejected — resurfacing" from Phase 4's cross-run history, confirming both the novelty guardrail and cross-run memory continue to work correctly together.
+- Committed and pushed.
 
 ### 2026-09-26 — Phase 4 complete, plus an async-shutdown incident note
 
