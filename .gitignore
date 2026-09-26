@@ -1,0 +1,35 @@
+# Generated data artifacts (generators are committed, output is not)
+data/db.sqlite
+data/ground_truth_signals.json
+data/literature_corpus.json
+
+# Long-term memory store (generated at runtime, not a source artifact)
+memory/*.sqlite
+memory/*.sqlite-journal
+memory/*.sqlite-wal
+memory/*.sqlite-shm
+
+# Run artifacts
+runs/*
+!runs/.gitkeep
+reports/*.md
+logs/*.jsonl
+eval/eval_results.md
+
+# LangGraph checkpointer db (smoke-test spike + CLI test runs)
+*.checkpoint.sqlite
+checkpoints.sqlite
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.DS_Store
+
+# Env
+.env
